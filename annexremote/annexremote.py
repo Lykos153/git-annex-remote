@@ -98,7 +98,7 @@ class SpecialRemote(with_metaclass(ABCMeta, object)):
         Note that the user is not required to provided all the settings listed here.
     """
 
-    def __init__(self, annex):
+    def __init__(self, annex=None):
         self.annex = annex
         self.info = {}
         self.configs = {}
@@ -543,8 +543,10 @@ class Protocol(object):
     It is not further documented as it was never intended to be part of the public API.
     """
 
-    def __init__(self, remote):
+    def __init__(self, remote, master):
         self.remote = remote
+        self.request_messages = _GitAnnexRequestMessages(self, self.remote)
+        self.master = master
         self.version = "VERSION 1"
         self.exporting = False
         self.extensions = list()
@@ -556,7 +558,7 @@ class Protocol(object):
             raise ProtocolError("Got empty line")
             
 
-        method = self.lookupMethod(parts[0]) or self.do_UNKNOWN
+        method = self.lookupMethod(parts[0])
 
 
         try:
@@ -567,14 +569,57 @@ class Protocol(object):
         except TypeError as e:
             raise SyntaxError(e)
         else:
-            if method != self.do_EXPORT:
+            if method != self.request_messages.do_EXPORT:
                 self.exporting = False
             return reply
 
     def lookupMethod(self, command):
-        return getattr(self, 'do_' + command.upper(), None)
+        return getattr(self.request_messages, 'do_' + command.upper(), self.request_messages.do_UNKNOWN)
         
-    def check_key(self, key):
+    def error(self, *args):
+        self._send("ERROR", *args)
+        
+    def debug(self, *args):
+        self._send("DEBUG", *args)
+
+    def _ask(self, request, reply_keyword, reply_count):
+        self._send(request)
+        line = self.master.input.readline().rstrip().split(" ", reply_count)
+        if line and line[0] == reply_keyword:
+            line.extend([""] * (reply_count+1-len(line)))
+            return line[1:]
+        else:
+            raise UnexpectedMessage("Expected {reply_keyword} and {reply_count} values. Got {line}".format(reply_keyword=reply_keyword, reply_count=reply_count, line=line))
+
+    def _askvalues(self, request):
+        self._send(request)
+        reply = []
+        while True:
+            # due to a bug in python 2 we can't use an iterator here: https://bugs.python.org/issue1633941
+            line = self.master.input.readline()
+            line = line.rstrip()
+            line = line.split(" ", 1)
+            if len(line) == 2 and line[0] == "VALUE":
+                 reply.append(line[1])
+            elif len(line) == 1 and line[0] == "VALUE":
+                return reply
+            else:
+                raise UnexpectedMessage("Expected VALUE {value}")
+
+    def _askvalue(self, request):
+        (reply,) = self._ask(request, "VALUE", 1)
+        return reply
+    
+    def _send(self, *args, **kwargs):
+        print(*args, file=self.master.output, **kwargs)
+        self.master.output.flush()
+
+class _GitAnnexRequestMessages(object):
+    def __init__(self, protocol, remote):
+        self.protocol = protocol
+        self.remote = remote
+
+    def _check_key(self, key):
         if len(key.split()) != 1:
             raise ValueError("Invalid key. Key contains whitespace character")
 
@@ -590,7 +635,7 @@ class Protocol(object):
             return "INITREMOTE-SUCCESS"
             
     def do_EXTENSIONS(self, param):
-        self.extensions = param.split(" ")
+        self.protocol.extensions = param.split(" ")
         return "EXTENSIONS"
     
     def do_PREPARE(self):
@@ -619,7 +664,7 @@ class Protocol(object):
             return "TRANSFER-SUCCESS {method} {key}".format(method=method, key=key)
     
     def do_CHECKPRESENT(self, key):
-        self.check_key(key)
+        self._check_key(key)
         try:
             if self.remote.checkpresent(key):
                 return "CHECKPRESENT-SUCCESS {key}".format(key=key)
@@ -629,7 +674,7 @@ class Protocol(object):
             return "CHECKPRESENT-UNKNOWN {key} {e}".format(key=key, e=e)
     
     def do_REMOVE(self, key):
-        self.check_key(key)
+        self._check_key(key)
         
         try:
             self.remote.remove(key)
@@ -707,7 +752,7 @@ class Protocol(object):
         
     
     def do_WHEREIS(self, key):
-        self.check_key(key)
+        self._check_key(key)
         reply = self.remote.whereis(key)
         if reply:
             return "WHEREIS-SUCCESS {reply}".format(reply=reply)
@@ -733,10 +778,10 @@ class Protocol(object):
             return "EXPORTSUPPORTED-FAILURE"
     
     def do_EXPORT(self, name):
-        self.exporting = name
+        self.protocol.exporting = name
     
     def do_TRANSFEREXPORT(self, param):
-        if not self.exporting:
+        if not self.protocol.exporting:
             raise ProtocolError("Export request without prior EXPORT")
         try:
             (method, key, file_) = param.split(" ", 2)
@@ -748,18 +793,18 @@ class Protocol(object):
         
         func = getattr(self.remote, "transferexport_{}".format(method.lower()), None)
         try:
-            func(key, file_, self.exporting)
+            func(key, file_, self.protocol.exporting)
         except RemoteError as e:
             return "TRANSFER-FAILURE {method} {key} {e}".format(method=method, key=key, e=e)
         else:
             return "TRANSFER-SUCCESS {method} {key}".format(method=method, key=key)
     
     def do_CHECKPRESENTEXPORT(self, key):
-        if not self.exporting:
+        if not self.protocol.exporting:
             raise ProtocolError("Export request without prior EXPORT")  
-        self.check_key(key)
+        self._check_key(key)
         try:
-            if self.remote.checkpresentexport(key, self.exporting):
+            if self.remote.checkpresentexport(key, self.protocol.exporting):
                 return "CHECKPRESENT-SUCCESS {key}".format(key=key)
             else:
                 return "CHECKPRESENT-FAILURE {key}".format(key=key)
@@ -767,12 +812,12 @@ class Protocol(object):
             return "CHECKPRESENT-UNKNOWN {key} {e}".format(key=key, e=e)
             
     def do_REMOVEEXPORT(self, key):
-        if not self.exporting:
+        if not self.protocol.exporting:
             raise ProtocolError("Export request without prior EXPORT")  
-        self.check_key(key)
+        self._check_key(key)
         
         try:
-            self.remote.removeexport(key, self.exporting)
+            self.remote.removeexport(key, self.protocol.exporting)
         except RemoteError as e:
             return "REMOVE-FAILURE {key} {e}".format(key=key, e=e)
         else:
@@ -787,7 +832,7 @@ class Protocol(object):
             return "REMOVEEXPORTDIRECTORY-SUCCESS"
     
     def do_RENAMEEXPORT(self, param):
-        if not self.exporting:
+        if not self.protocol.exporting:
             raise ProtocolError("Export request without prior EXPORT")  
         try:
             (key, new_name) = param.split(None, 1)
@@ -795,7 +840,7 @@ class Protocol(object):
             raise SyntaxError("Expected TRANSFER STORE Key File")
             
         try:
-            self.remote.renameexport(key, self.exporting, new_name)
+            self.remote.renameexport(key, self.protocol.exporting, new_name)
         except RemoteError:
             return "RENAMEEXPORT-FAILURE {key}".format(key=key)
         else:
@@ -831,6 +876,7 @@ class Master(object):
             Default: sys.stdout
         """
         self.output = output
+        self.input = sys.stdin
 
     def LinkRemote(self, remote):
         """
@@ -843,7 +889,8 @@ class Master(object):
             ExternalSpecialRemote interface to which this master will be linked.
         """
         self.remote = remote
-        self.protocol = Protocol(remote)
+        self.protocol = Protocol(remote, self)
+        self.remote.annex = SpecialRemoteMessages(self.protocol)
 
     def LoggingHandler(self):
         """
@@ -853,7 +900,7 @@ class Master(object):
         -------
         AnnexLoggingHandler
         """
-        return AnnexLoggingHandler(self)
+        return AnnexLoggingHandler(self.protocol)
 
     def Listen(self, input=sys.stdin):
         """
@@ -874,7 +921,7 @@ class Master(object):
             raise NotLinkedError("Please execute LinkRemote(remote) first.")
 
         self.input = input
-        self._send(self.protocol.version)
+        self.protocol._send(self.protocol.version)
         while True:
             # due to a bug in python 2 we can't use an iterator here: https://bugs.python.org/issue1633941
             line = self.input.readline()
@@ -884,43 +931,32 @@ class Master(object):
             try:
                 reply = self.protocol.command(line)
                 if reply:
-                    self._send(reply)
+                    self.protocol._send(reply)
             except UnsupportedRequest:
-                self._send ("UNSUPPORTED-REQUEST")
+                self.protocol._send ("UNSUPPORTED-REQUEST")
             except Exception as e:
                 for line in traceback.format_exc().splitlines():
-                    self.debug(line)
-                self.error(e)
+                    self.protocol.debug(line)
+                self.protocol.error(e)
                 raise SystemExit
 
-    def _ask(self, request, reply_keyword, reply_count):
-        self._send(request)
-        line = self.input.readline().rstrip().split(" ", reply_count)
-        if line and line[0] == reply_keyword:
-            line.extend([""] * (reply_count+1-len(line)))
-            return line[1:]
-        else:
-            raise UnexpectedMessage("Expected {reply_keyword} and {reply_count} values. Got {line}".format(reply_keyword=reply_keyword, reply_count=reply_count, line=line))
 
-    def _askvalues(self, request):
-        self._send(request)
-        reply = []
-        while True:
-            # due to a bug in python 2 we can't use an iterator here: https://bugs.python.org/issue1633941
-            line = self.input.readline()
-            line = line.rstrip()
-            line = line.split(" ", 1)
-            if len(line) == 2 and line[0] == "VALUE":
-                 reply.append(line[1])
-            elif len(line) == 1 and line[0] == "VALUE":
-                return reply
-            else:
-                raise UnexpectedMessage("Expected VALUE {value}")
+class SpecialRemoteMessages:
+    def __init__(self, protocol):
+        self.protocol = protocol
 
-    def _askvalue(self, request):
-        (reply,) = self._ask(request, "VALUE", 1)
-        return reply
-    
+    def _ask(self, *args, **kwargs):
+        return self.protocol._ask(*args, **kwargs)
+
+    def _askvalues(self, *args, **kwargs):
+        return self.protocol._askvalues(*args, **kwargs)
+
+    def _askvalue(self, *args, **kwargs):
+        return self.protocol._askvalue(*args, **kwargs)
+
+    def _send(self, *args, **kwargs):
+        return self.protocol._send(*args, **kwargs)
+
     def getconfig(self, setting):
         """
         Gets one of the special remote's configuration settings,
@@ -1011,7 +1047,7 @@ class Master(object):
             The message to be displayed to the user
         """
 
-        self._send("DEBUG", *args)
+        self.protocol.debug(*args)
         
     def error(self, *args):
         """
@@ -1025,7 +1061,7 @@ class Master(object):
         error_msg : str
             The error message to be sent to git-annex
         """
-        self._send("ERROR", *args)
+        self.protocol.error(*args)
 
     def progress(self, progress):
         """
@@ -1336,7 +1372,3 @@ class Master(object):
         else:
             raise ProtocolError("GETGITREMOTENAME not available") 
             
-
-    def _send(self, *args, **kwargs):
-        print(*args, file=self.output, **kwargs)
-        self.output.flush()
