@@ -9,21 +9,9 @@
 # warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 #
 
-from __future__ import print_function
-from __future__ import unicode_literals
-from __future__ import division
-from __future__ import absolute_import
-from builtins import int
-from builtins import str
-from future import standard_library
-standard_library.install_aliases()
-from future.utils import with_metaclass
-from builtins import object
+from abc import ABC, abstractmethod
 
 import logging
-
-from abc import ABCMeta, abstractmethod
-
 import sys, traceback
 import string
 
@@ -74,7 +62,7 @@ class AnnexLoggingHandler(logging.StreamHandler):
         for line in log_entry.splitlines():
             self.annex.debug(line)
 
-class SpecialRemote(with_metaclass(ABCMeta, object)):
+class SpecialRemote(ABC):
     """
     Metaclass for non-export remotes.
 
@@ -534,7 +522,7 @@ class ExportRemote(SpecialRemote):
         """
         raise UnsupportedRequest()
         
-class Protocol(object):
+class Protocol:
     """
     Helper class handling the receiving part of the protocol (git-annex to remote)
     It parses the requests coming from git-annex and calls the respective
@@ -614,7 +602,7 @@ class Protocol(object):
         print(*args, file=self.master.output, **kwargs)
         self.master.output.flush()
 
-class _GitAnnexRequestMessages(object):
+class _GitAnnexRequestMessages:
     def __init__(self, protocol, remote):
         self.protocol = protocol
         self.remote = remote
@@ -846,7 +834,7 @@ class _GitAnnexRequestMessages(object):
         else:
             return "RENAMEEXPORT-SUCCESS {key}".format(key=key)
 
-class Master(object):
+class Master:
     """
     Metaclass for non-export remotes.
 
